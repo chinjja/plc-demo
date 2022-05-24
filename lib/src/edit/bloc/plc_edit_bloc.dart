@@ -30,7 +30,7 @@ class PlcEditBloc extends Bloc<PlcEditEvent, PlcEditState> {
       }
       emit(state.copyWith(status: PlcEditStatus.inProgress));
       _plc.writeInt(data.address + 2, state.value);
-      _plc.writeInt(data.address + 5, state.value);
+      // _plc.writeInt(data.address + 5, state.value);
       final res = await _plc.writeInt(data.address, state.value);
       if (res == null) {
         emit(state.copyWith(status: PlcEditStatus.failure));

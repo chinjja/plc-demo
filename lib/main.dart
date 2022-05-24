@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_app1/src/repo/plc.dart';
 import 'package:flutter_app1/src/list/view/plc_page.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:modbus/modbus.dart';
 
 void main() {
   runApp(const MyApp());
@@ -14,7 +15,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return RepositoryProvider(
-      create: (context) => Plc('192.168.1.6'),
+      create: (context) => Plc(createTcpClient('192.168.1.6')),
       child: MaterialApp(
         title: 'Flutter Demo',
         theme: ThemeData(

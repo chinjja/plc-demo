@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart';
 import 'package:modbus/modbus.dart' as modbus;
 import 'package:rxdart/rxdart.dart';
 
@@ -10,16 +9,17 @@ class Plc {
   int get maxDataLength => 125;
   int get maxBitLength => 1760;
 
-  final String ip;
-  modbus.ModbusClient? client;
+  final modbus.ModbusClient client;
+  var _open = false;
+  bool get isOpen => _open;
 
-  Plc(this.ip);
+  Plc(this.client);
 
   final _coils = BehaviorSubject.seeded(<int, bool>{});
   final _inputs = BehaviorSubject.seeded(<int, bool>{});
   final _dataRegisters = BehaviorSubject.seeded(<int, int>{});
   final _inputRegisters = BehaviorSubject.seeded(<int, int>{});
-  final _queue = Queue<ReadRequest>();
+  final _queue = Queue<_Request>();
   late final _repeat = RepeatStream<_Request>((_) async* {
     if (_queue.isEmpty) {
       await Future.delayed(const Duration(seconds: 1));
@@ -29,26 +29,70 @@ class Plc {
       yield item;
     }
   });
-  final _trigger = BehaviorSubject();
-  late final _triggerStream =
-      _trigger.sampleTime(const Duration(milliseconds: 100));
-  final _write = BehaviorSubject<WriteValue>();
-  late final _writeGather = _write.stream
-      .buffer(_triggerStream)
-      .where((e) => e.isNotEmpty)
-      .flatMap((list) async* {
-    list = list.toList();
-    list.sort((a, b) => a.address.compareTo(b.address));
-    final prev = await _dataRegisters.first;
-    final data = <int>[];
-    final obj = <WriteValue>[];
-    var startAddress = list.first.address;
+  final _flush = PublishSubject();
+  void flush() {
+    _flush.add(null);
+  }
 
-    send() async* {
-      final req = WriteMultiRegisters(
-        address: startAddress,
-        data: Uint16List.fromList(data),
+  final _trigger = PublishSubject();
+  late final onTrigger = _trigger.switchMap(
+    (_) => Rx.race(
+      [
+        _flush,
+        Rx.timer(0, const Duration(milliseconds: 100)),
+      ],
+    ),
+  );
+
+  final _write = PublishSubject<_WriteValue<int>>();
+  late final _writeGather = _buffer(_write).flatMap(
+    (list) async* {
+      final prev = await _dataRegisters.first;
+      yield* _process<int>(
+        list,
+        (address, data) => WriteMultiRegisters(
+          address: address,
+          data: Uint16List.fromList(data),
+        ),
+        (address) => prev[address] ?? 0,
       );
+    },
+  );
+  final _writeCoils = PublishSubject<_WriteValue<bool>>();
+  late final _writeCoilsGather = _buffer(_writeCoils).flatMap(
+    (list) async* {
+      final prev = await _coils.first;
+      yield* _process<bool>(
+        list,
+        (address, data) => WriteMultiCoils(
+          address: address,
+          data: List.from(data),
+        ),
+        (address) => prev[address] ?? false,
+      );
+    },
+  );
+
+  Stream<List<_WriteValue<T>>> _buffer<T>(
+          PublishSubject<_WriteValue<T>> subject) =>
+      subject.stream
+          .doOnData((e) => _trigger.add(e))
+          .buffer(onTrigger)
+          .where((e) => e.isNotEmpty);
+
+  Stream<WriteRequest> _process<V>(
+    List<_WriteValue<V>> requests,
+    WriteRequest Function(int address, List<V> data) chunk,
+    V Function(int address) get,
+  ) async* {
+    requests = requests.toList();
+    requests.sort((a, b) => a.address.compareTo(b.address));
+    final data = <V>[];
+    final obj = <_WriteValue<V>>[];
+    var startAddress = requests.first.address;
+
+    _do() async* {
+      final req = chunk(startAddress, data);
       yield req;
       try {
         await req.future;
@@ -62,86 +106,31 @@ class Plc {
       }
     }
 
-    for (int i = 0; i < list.length; i++) {
-      final s = list[i];
+    for (int i = 0; i < requests.length; i++) {
+      final s = requests[i];
       data.add(s.data);
       obj.add(s);
-      if (i == list.length - 1) {
-        yield* send();
+      if (i == requests.length - 1) {
+        yield* _do();
         break;
       }
-      final e = list[i + 1];
+      final e = requests[i + 1];
       if (s.address == e.address) {
         data.removeLast();
       }
 
       if (e.address - startAddress >= maxDataLength) {
-        yield* send();
+        yield* _do();
         startAddress = e.address;
         data.clear();
         obj.clear();
         continue;
       }
       for (int j = s.address + 1; j < e.address; j++) {
-        data.add(prev[j] ?? 0);
+        data.add(get(j));
       }
     }
-  });
-  final _writeCoils = BehaviorSubject<WriteBit>();
-  late final _writeCoilsGather = _writeCoils.stream
-      .buffer(_triggerStream)
-      .where((e) => e.isNotEmpty)
-      .flatMap((list) async* {
-    list = list.toList();
-    list.sort((a, b) => a.address.compareTo(b.address));
-    final prev = await _coils.first;
-    final data = <bool>[];
-    final obj = <WriteBit>[];
-    var startAddress = list.first.address;
-
-    send() async* {
-      final req = WriteMultiCoils(
-        address: startAddress,
-        data: [...data],
-      );
-      yield req;
-      try {
-        await req.future;
-        for (final o in obj) {
-          o._completer.complete();
-        }
-      } catch (e) {
-        for (var o in obj) {
-          o._completer.completeError(e);
-        }
-      }
-    }
-
-    for (int i = 0; i < list.length; i++) {
-      final s = list[i];
-      data.add(s.data);
-      obj.add(s);
-      if (i == list.length - 1) {
-        yield* send();
-        break;
-      }
-      final e = list[i + 1];
-      if (s.address == e.address) {
-        data.removeLast();
-      }
-
-      if (e.address - startAddress >= maxDataLength) {
-        yield* send();
-        startAddress = e.address;
-        data.clear();
-        obj.clear();
-        continue;
-      }
-      for (int j = s.address + 1; j < e.address; j++) {
-        data.add(prev[j] ?? false);
-      }
-    }
-  });
+  }
 
   StreamSubscription? _subscription;
   Stream<Map<int, bool>> get onCoils => _coils.stream;
@@ -150,10 +139,9 @@ class Plc {
   Stream<Map<int, int>> get onInputRegisters => _inputRegisters.stream;
 
   Future<void> connect() async {
-    if (client != null) return;
-    client = modbus.createTcpClient(ip);
-
-    await client!.connect();
+    if (isOpen) return;
+    await client.connect();
+    _open = true;
 
     _subscription = Rx.merge<_Request>([
       _repeat,
@@ -161,7 +149,7 @@ class Plc {
       _writeCoilsGather,
     ]).asyncMap((event) async {
       if (event is WriteSingleRegister) {
-        final res = await client!.writeSingleRegister(
+        final res = await client.writeSingleRegister(
           event.address,
           event.data,
         );
@@ -175,7 +163,7 @@ class Plc {
 
         event._completer.complete(res);
       } else if (event is WriteSingleCoil) {
-        final res = await client!.writeSingleCoil(
+        final res = await client.writeSingleCoil(
           event.address,
           event.data,
         );
@@ -189,7 +177,7 @@ class Plc {
 
         event._completer.complete(res);
       } else if (event is WriteMultiRegisters) {
-        await client!.writeMultipleRegisters(
+        await client.writeMultipleRegisters(
           event.address,
           event.data,
         );
@@ -202,7 +190,7 @@ class Plc {
         _dataRegisters.add(data);
         event._completer.complete();
       } else if (event is WriteMultiCoils) {
-        await client!.writeMultipleCoils(
+        await client.writeMultipleCoils(
           event.address,
           event.data,
         );
@@ -215,7 +203,7 @@ class Plc {
         _coils.add(data);
         event._completer.complete();
       } else if (event is ReadHoldingRegisters) {
-        final res = await client!.readHoldingRegisters(
+        final res = await client.readHoldingRegisters(
           event.address,
           event.amount,
         );
@@ -223,7 +211,7 @@ class Plc {
         final data = _update(await _inputRegisters.first, event.address, res);
         _dataRegisters.add(data);
       } else if (event is ReadInputRegisters) {
-        final res = await client!.readInputRegisters(
+        final res = await client.readInputRegisters(
           event.address,
           event.amount,
         );
@@ -231,7 +219,7 @@ class Plc {
         final data = _update(await _inputRegisters.first, event.address, res);
         _inputRegisters.add(data);
       } else if (event is ReadCoils) {
-        final res = await client!.readCoils(
+        final res = await client.readCoils(
           event.address,
           event.amount,
         );
@@ -240,7 +228,7 @@ class Plc {
             .map((key, value) => MapEntry(key, value ?? false));
         _coils.add(data);
       } else if (event is ReadInputs) {
-        final res = await client!.readDiscreteInputs(
+        final res = await client.readDiscreteInputs(
           event.address,
           event.amount,
         );
@@ -254,14 +242,11 @@ class Plc {
   }
 
   Future<void> close() async {
-    if (client == null) return;
-    await _subscription?.cancel();
-    await client?.close();
-    client = null;
-  }
-
-  bool isOpen() {
-    return client != null;
+    if (isOpen) {
+      _open = false;
+      await _subscription?.cancel();
+      await client.close();
+    }
   }
 
   Map<int, T> _update<T>(Map<int, T> map, int address, List<T> data) {
@@ -279,23 +264,21 @@ class Plc {
   }
 
   Future<int?> writeInt(int address, int value) async {
-    final request = WriteValue(
+    final request = _WriteValue(
       address: address,
       data: value,
     );
     _write.add(request);
-    _trigger.add(request);
     await request.future;
     return value;
   }
 
   Future<bool?> writeCoil(int address, bool value) async {
-    final request = WriteBit(
+    final request = _WriteValue(
       address: address,
       data: value,
     );
     _writeCoils.add(request);
-    _trigger.add(request);
     await request.future;
     return value;
   }
@@ -309,20 +292,12 @@ class Plc {
   }
 }
 
-class WriteValue {
+class _WriteValue<T> {
   final _completer = Completer<void>();
   Future<void> get future => _completer.future;
   final int address;
-  final int data;
-  WriteValue({required this.address, required this.data});
-}
-
-class WriteBit {
-  final _completer = Completer<void>();
-  Future<void> get future => _completer.future;
-  final int address;
-  final bool data;
-  WriteBit({required this.address, required this.data});
+  final T data;
+  _WriteValue({required this.address, required this.data});
 }
 
 abstract class _Request<T> {
